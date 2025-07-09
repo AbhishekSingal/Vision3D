@@ -855,7 +855,7 @@ class ModelWindow(QMainWindow):
     def loadInitialModel(self):
         desktop = Path.home() 
         file_path = desktop / "Projects"
-        file_path /= "3D_TEMP"
+        file_path /= "Vision3D"
         file_path /= "3DModels"
         file_path /= "Untitled.model"
         self.writeEmptyModelFile(file_path)
