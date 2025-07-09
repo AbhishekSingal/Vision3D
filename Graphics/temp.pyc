@@ -1,0 +1,634 @@
+import numpy as np
+import pyvista as pv
+from pyvistaqt import QtInteractor
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QPushButton, QVBoxLayout, 
+    QWidget, QLabel, QHBoxLayout, QLineEdit, QFileDialog, QSplitter
+)
+from PyQt5.QtCore import QTimer
+import trimesh
+import os
+import json
+from datetime import datetime
+from PyQt5.QtWidgets import QDialog, QInputDialog, QScrollArea, QDialogButtonBox
+from PyQt5.QtWidgets import QDockWidget, QTreeWidget, QTreeWidgetItem, QLabel, QVBoxLayout, QWidget
+from PyQt5.QtWidgets import QDialog, QVBoxLayout, QListWidget, QLabel
+from PyQt5.QtCore import Qt
+
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QLineEdit, QPushButton, QLabel, QSplitter, QDialog, QListWidget,
+    QTabWidget, QDockWidget, QMenuBar, QMenu, QAction
+)
+
+import Styles.colors as cl
+
+
+#3D Graphics Renderer Class
+class Renderer(QWidget):
+    def __init__(self):
+        super().__init__()
+
+        #Graph Data Points
+        self.points = []
+        self.edges = []
+        self.selected_points = []
+        self.surfaces = []  # List to store all created surface meshes
+        self.surfaces_stores = []  # Store original surface points for animation
+        self.sensors = []  # List to store Sensor objects
+        self.selected_sensor = -1  # Index of currently selected sensor
+
+        # UI and 3D setup
+        self.setup_ui()
+
+        #Initial Setup
+        self.surface_mesh = None  # Store the surface
+        self.surface_actor = None
+        self.original_surface_points = None
+        self.vibration_timer = QTimer()
+        self.vibration_timer.timeout.connect(self.animateSurface)
+        self.vibration_phase = 0.0
+
+        #Directory tracing
+        self.current_file_path = None
+
+        #Customisations
+        self.pointColor = [255,0,0]
+        self.pointSelectedColor = [0,0,255]
+        
+        self.surfaceColor = 'lightgreen'
+        self.surfaceEdgeColor = 'white'
+        self.surfaceOpacity = 0.6
+        self.surfaceEdges = True
+
+        self.sensorColor = [255, 255, 0]
+        self.sensorSelectedColor = [0,255,0]
+
+
+
+        #================ SUCCESS AND ERROR CODES ================#
+        self.MODEL_SAVED = 0
+        self.MODEL_NOT_SAVED = 1
+
+        self.MODEL_LOADED_SUCCESSFULL = 2
+        self.MODEL_LOADED_FAILED = 3
+
+        self.INSUFFICIENT_DATA = 4
+
+        self.SURFACE_DRAW_SUCCESSFULL = 5
+        self.SURFACE_DRAW_FAILED = 6
+
+        self.GLTF_EXPORT_SUCCESSFULL = 7
+        self.GLTF_EXPORT_FAILED = 8
+
+        self.RANGE_ERROR = 9
+
+        self.POINT_SELECTED = 10
+        self.POINT_DESELECTED = 11
+
+        self.INVALID_DATA = 12
+        self.POINT_CONNECT_SUCCESSFULL = 13
+        self.CLEARED = 14
+
+        self.VIBRATION_STARTED = 15
+        self.VIBRATION_STOPPED = 16
+
+        self.POINTS_NOT_COLLINEAR = 17
+        #=========================================================#
+
+    def setup_ui(self):
+        layout = QVBoxLayout()
+        layout.setContentsMargins(0,0,0,0)
+        layout.setSpacing(0)
+
+        self.initializeRenderer()
+
+        layout.addWidget(self.plotter,1)
+
+        self.setLayout(layout)
+
+    def initializeRenderer(self):
+        #========== 3D RENDERER ==========#
+        self.plotter = QtInteractor(self)
+        self.plotter.set_background(cl.SYS_BG4)  # Dark gray
+        self.plotter.interactor.setFocus()
+        self.plotter.enable_terrain_style()
+        self.plotter.add_axes(interactive=True)
+        self.plotter.enable_point_picking(
+            callback=self.handle_pick,
+            use_mesh=False,
+            show_point=True,
+            tolerance=1,
+            left_clicking=True,
+            show_message=False,
+        )
+
+        axis_length = 1
+        x_line = pv.Line((0, 0, 0), (axis_length, 0, 0))
+        y_line = pv.Line((0, 0, 0), (0, axis_length, 0))
+        z_line = pv.Line((0, 0, 0), (0, 0, axis_length))
+
+        self.plotter.add_mesh(x_line, color='red', line_width=2)
+        self.plotter.add_mesh(y_line, color='green', line_width=2)
+        self.plotter.add_mesh(z_line, color='blue', line_width=2)
+
+        #=================================#
+
+    def drawMultiplePoints(self,points):
+        self.points.extend(points)
+        self.updatePlot()
+
+    def addSensor(self,x:float,y:float,z:float):
+        self.sensors.append([x,y,z])
+        self.updatePlot()
+
+    def saveModeltoFile(self, file_path):
+        if not file_path.endswith('.json'):
+            file_path += '.json'
+
+        try:
+            # Ensure all elements are native Python types
+            points = [list(map(float, point)) for point in self.points]
+            edges = [list(map(int, edge)) for edge in self.edges]
+            surfaces = [
+                [[int(coord) for coord in point] for point in surface]
+                for surface in self.surfaces_stores
+            ]
+            sensors = [list(map(float, sensor)) for sensor in self.sensors]
+
+            structure_data = {
+                "points": points,
+                "edges": edges,
+                "surfaces": surfaces,
+                "sensors": sensors,
+                "meta": {
+                    "created_by": "Dhruv",
+                    "timestamp": datetime.utcnow().isoformat() + "Z",
+                    "filename": os.path.basename(file_path)
+                }
+            }
+
+            with open(file_path, 'w') as f:
+                json.dump(structure_data, f, indent=2)
+
+            self.current_file_path = file_path
+            return self.MODEL_SAVED
+        except Exception as e:
+            return self.MODEL_NOT_SAVED
+
+    def loadModelFromFile(self, file_path):
+        try:
+            with open(file_path, 'r') as f:
+                data = json.load(f)
+
+            self.points = data["points"]
+            self.edges = data["edges"]
+            self.surfaces = []  # clear current surfaces
+            self.surfaces_stores = []
+            self.current_file_path = file_path
+
+            self.loaded_mesh = None  # No mesh; reconstructing
+
+            self.plotter.clear()
+
+            # For each stored surface (array of points), generate surface mesh
+            for surface_points in data.get("surfaces", []):
+                self.drawSurface(surface_points)
+            
+            self.updatePlot()
+
+            return self.MODEL_LOADED_SUCCESSFULL
+        except Exception as e:
+            return self.MODEL_LOADED_FAILED
+        
+    def drawSurface(self,points):
+        pts = np.array(points)
+        self.surfaces_stores.append(pts.copy())
+
+        surface = pv.PolyData(pts).delaunay_2d()
+        surface = surface.subdivide(nsub=3, subfilter="linear")
+        surface = surface.smooth(n_iter=100, relaxation_factor=0.1)
+        self.surfaces.append(surface)
+
+        self.plotter.add_mesh(
+            surface,
+            color=self.surfaceColor,
+            opacity=self.surfaceOpacity,
+            name=f'surface_{len(self.surfaces)}',
+            pickable=False,
+            show_edges=self.surfaceEdges,
+            edge_color=self.surfaceEdgeColor,
+            lighting=True,
+            specular=1.0,
+            smooth_shading=True
+        )
+
+    def drawSurfaceFromSelection(self):
+        if len(self.selected_points) < 3:
+            return self.INSUFFICIENT_DATA
+
+        points = [self.points[i] for i in self.selected_points]
+        self.drawSurface(points)
+        self.selected_points.clear()
+        self.updatePlot(redraw_surfaces=False)
+
+        return self.SURFACE_DRAW_SUCCESSFULL
+
+    def updatePlot(self, redraw_surfaces=True):
+        """Refresh 3D scene, optionally skipping surface re-addition."""
+
+        # Remove old meshes
+        self.plotter.remove_actor("points_mesh", reset_camera=False)
+        self.plotter.remove_actor("sensors_mesh", reset_camera=False)  # <--- REMOVE sensor actors
+
+        # If no points, nothing to draw
+        if not self.points:
+            return
+
+        # Create PolyData mesh from points
+        mesh = pv.PolyData(np.array(self.points, dtype=np.float32))  # Use float32 to avoid warnings
+
+        # If edges exist, create lines representation
+        if self.edges:
+            # Each line has format [num_points_in_line, point1_index, point2_index]
+            lines = np.array([[2, *edge] for edge in self.edges])
+            mesh.lines = lines
+
+        # Assign colors: red for selected points, blue otherwise
+        colors = np.array([
+            self.pointSelectedColor if i in self.selected_points else self.pointColor
+            for i in range(len(self.points))
+        ])
+        mesh["colors"] = colors
+
+        # === Draw sensors (as regular points) ===
+        if self.sensors:
+            sensor_coords = np.array(self.sensors, dtype=np.float32)
+            sensor_mesh = pv.PolyData(sensor_coords)
+
+            sensor_colors = np.array([
+                [255, 255, 0] if i == self.selected_sensor else [0, 255, 0]
+                for i in range(len(self.sensors))
+            ])
+            sensor_mesh["colors"] = sensor_colors
+
+            self.plotter.add_mesh(
+                sensor_mesh,
+                scalars="colors",
+                rgb=True,
+                name="sensor_mesh",
+                point_size=15,
+                render_points_as_spheres=True
+    )
+
+
+        # Add points mesh to plotter
+        self.plotter.add_mesh(
+            mesh,
+            scalars="colors",
+            rgb=True,
+            name="points_mesh",
+            point_size=15,
+            render_points_as_spheres=True,
+            line_width=5,
+        )
+
+        # Optionally redraw surfaces if any (like generated mesh surfaces)
+        # if redraw_surfaces and hasattr(self, "surfaces"):
+        for i, surface in enumerate(self.surfaces):
+            self.plotter.add_mesh(
+                surface,
+                color=self.surfaceColor,
+                opacity=self.surfaceOpacity,
+                name=f'surface_{len(self.surfaces)}',
+                pickable=False,
+                show_edges=self.surfaceEdges,
+                edge_color=self.surfaceEdgeColor,
+                lighting=True,
+                specular=1.0,
+                smooth_shading=True 
+            )
+
+        # Reset camera to include all points
+        self.plotter.reset_camera()
+
+    def clearHighlights(self):
+        # Clear selections
+        self.selected_points.clear()
+        self.selected_sensor = -1  # Deselect any highlighted sensor
+
+        # Remove highlight actors
+        for name in ['highlight_point', 'highlight_line', 'highlight_surface', 'highlight_sensor']:
+            try:
+                self.plotter.remove_actor(name)
+            except Exception:
+                pass
+
+    def highlightPoint(self,idx):
+        self.clearHighlights()
+        if idx < 0 or idx >= len(self.points):
+            return
+        # Use a single point mesh with larger point size and red color
+        mesh = pv.PolyData([self.points[idx]])
+        colors = np.array([[255, 0, 0]])  # red
+        mesh["colors"] = colors
+        self.plotter.add_mesh(
+            mesh,
+            scalars="colors",
+            rgb=True,
+            name="highlight_point",
+            point_size=15,  # same size as normal points
+            render_points_as_spheres=True,
+        )
+        self.plotter.render()
+
+    def highlightLine(self,idx):        
+        self.clearHighlights()
+        if idx < 0 or idx >= len(self.edges):
+            return
+        p1_idx, p2_idx = self.edges[idx]
+        p1 = self.points[p1_idx]
+        p2 = self.points[p2_idx]
+        line = pv.Line(p1, p2)
+        self.plotter.add_mesh(line, color='red', line_width=5, name='highlight_line')
+        self.plotter.render()
+
+    def highlightSurface(self,idx):
+        self.clearHighlights()
+        if idx < 0 or idx >= len(self.surfaces_stores):
+            return
+        surface_points = np.array(self.surfaces_stores[idx], dtype=np.float32)
+        if len(surface_points) < 3:
+            # Can't create surface mesh with fewer than 3 points, just highlight points instead
+            for pt in surface_points:
+                sphere = pv.Sphere(center=pt, radius=0.1)
+                self.plotter.add_mesh(sphere, color='orange', name='highlight_surface')
+        else:
+            surface = pv.PolyData(surface_points).delaunay_2d()
+            self.plotter.add_mesh(surface, color='orange', opacity=0.6, name='highlight_surface', show_edges=True)
+        self.plotter.render()
+
+    def highlightSensor(self, idx):
+        self.clearHighlights()
+        if idx < 0 or idx >= len(self.sensors):
+            return
+        self.updatePlot()  # Will trigger color update based on selected_sensor
+
+    def animateSurface(self):
+        if not self.surfaces:
+            return
+        current_surface = self.surfaces[-1]  # Use the last generated surface
+        amp = 0.1           # Vibration amplitude
+        freq = 2.0          # Frequency (Hz)
+        t = self.vibration_phase
+        points = current_surface.points.copy()
+
+        # Wave-like motion using phase shift based on point index
+        phase_shift = np.linspace(0, 2 * np.pi, len(points))
+        points[:, 2] += amp * np.sin(2 * np.pi * freq * t + phase_shift)
+
+        current_surface.points = points
+        self.surface_modified = True
+        self.vibration_phase += 0.05
+        self.plotter.update()
+
+    def exportGLTF(self,file_path):
+        if not self.points and not self.surfaces:
+            return self.INSUFFICIENT_DATA
+        
+        try:
+            # Create a scene to hold all meshes
+            scene = trimesh.Scene()
+
+            # Export points as small spheres
+            if self.points:
+                for i, point in enumerate(self.points):
+                    sphere = trimesh.creation.icosphere(subdivisions=1, radius=0.05)
+                    sphere.apply_translation(point)
+                    
+                    # Color based on selection
+                    if i in self.selected_points:
+                        sphere.visual.face_colors = [255, 0, 0, 255]  # Red for selected
+                    else:
+                        sphere.visual.face_colors = [0, 0, 255, 255]  # Blue for unselected
+                    
+                    scene.add_geometry(sphere, node_name=f'point_{i}')
+
+            # Export edges as cylinders
+            if self.edges:
+                for i, edge in enumerate(self.edges):
+                    p1 = np.array(self.points[edge[0]])
+                    p2 = np.array(self.points[edge[1]])
+                    
+                    # Calculate cylinder parameters
+                    direction = p2 - p1
+                    length = np.linalg.norm(direction)
+                    center = (p1 + p2) / 2
+                    
+                    if length > 0:
+                        # Create cylinder
+                        cylinder = trimesh.creation.cylinder(radius=0.02, height=length)
+                        
+                        # Align cylinder with edge direction
+                        if not np.allclose(direction, [0, 0, length]):
+                            # Calculate rotation to align cylinder with edge
+                            z_axis = np.array([0, 0, 1])
+                            direction_norm = direction / length
+                            
+                            if not np.allclose(direction_norm, z_axis):
+                                rotation_axis = np.cross(z_axis, direction_norm)
+                                if np.linalg.norm(rotation_axis) > 1e-6:
+                                    rotation_axis = rotation_axis / np.linalg.norm(rotation_axis)
+                                    angle = np.arccos(np.clip(np.dot(z_axis, direction_norm), -1, 1))
+                                    rotation_matrix = trimesh.transformations.rotation_matrix(angle, rotation_axis)
+                                    cylinder.apply_transform(rotation_matrix)
+                        
+                        cylinder.apply_translation(center)
+                        cylinder.visual.face_colors = [0, 255, 0, 255]  # Green for edges
+                        scene.add_geometry(cylinder, node_name=f'edge_{i}')
+
+            # Export surfaces
+            if self.surfaces:
+                for i, surface in enumerate(self.surfaces):
+                    # Convert PyVista mesh to trimesh
+                    vertices = surface.points
+                    faces = surface.faces.reshape(-1, 4)[:, 1:4]  # Remove the first column (face size)
+                    
+                    mesh = trimesh.Trimesh(vertices=vertices, faces=faces)
+                    mesh.visual.face_colors = [0, 255, 0, 128]  # Semi-transparent green
+                    scene.add_geometry(mesh, node_name=f'surface_{i}')
+
+            # Export the scene
+            scene.export(file_path)
+            
+            self.GLTF_EXPORT_SUCCESSFULL
+            
+        except Exception as e:
+            self.GLTF_EXPORT_FAILED
+
+    def pickPoint(self,picked):
+        if not self.points:
+            return self.INSUFFICIENT_DATA
+
+        pts = np.array(self.points)
+        dists = np.linalg.norm(pts - picked, axis=1)
+        nearest = np.argmin(dists)
+        if dists[nearest] > self.selectionThreshold():
+            return self.RANGE_ERROR
+
+        if nearest in self.selected_points:
+            self.selected_points.remove(nearest)
+            self.POINT_DESELECTED
+        else:
+            self.selected_points.append(nearest)
+            self.POINT_SELECTED
+        
+        self.updatePlot()
+
+    def pickSensor(self, picked):
+        if not self.sensors:
+            return self.INSUFFICIENT_DATA  # Nothing to pick
+        pts = np.array(self.sensors, dtype=np.float32)
+        dists = np.linalg.norm(pts - picked, axis=1)
+        nearest_index = np.argmin(dists)
+
+        if dists[nearest_index] > self.selectionThreshold():
+            return self.RANGE_ERROR  # Too far from any sensor
+
+        # Set selected sensor to the nearest one found
+        self.selected_sensor = nearest_index
+
+        self.updatePlot()
+        return True
+
+    def handle_pick(self, picked):
+        if self.pickSensor(picked) != self.INSUFFICIENT_DATA:
+            return
+        self.pickPoint(picked)
+
+    def selectionThreshold(self):
+        if len(self.points) < 2:
+            return 0.5
+        dists = [
+            np.linalg.norm(np.array(self.points[i]) - np.array(self.points[j]))
+            for i in range(len(self.points)) for j in range(i+1, len(self.points))
+        ]
+        return np.mean(dists) * 0.5
+
+    def addPoint(self,x:float,y:float,z:float):
+        coords = [x,y,z]
+        self.points.append(coords)
+        self.updatePlot()
+    
+    def connectSelectedPoints(self):
+        if len(self.selected_points) != 2:
+            return self.INVALID_DATA
+        edge = sorted(self.selected_points)
+        if edge in [sorted(e) for e in self.edges]:
+            return self.INVALID_DATA
+        self.edges.append(edge)
+        self.selected_points.clear()
+        self.updatePlot()
+        return self.POINT_CONNECT_SUCCESSFULL
+
+    def clearSelection(self):
+        self.selected_points.clear()
+        self.selected_sensor = -1  # Deselect any highlighted sensor
+        self.updatePlot()
+        return self.CLEARED
+    
+    def clearAll(self):
+        self.points.clear()
+        self.edges.clear()
+        self.selected_points.clear()
+        self.surfaces.clear()
+        self.surfaces_stores.clear()
+        self.plotter.clear()
+        self.plotter.reset_camera()
+        self.loaded_mesh = None
+        self.updatePlot()
+
+        return self.CLEARED
+
+    def startVibration(self):
+        if not self.vibration_timer.isActive():
+            self.vibration_timer.start(50)  # ~20 FPS
+            return self.VIBRATION_STARTED
+
+        else:
+            self.vibration_timer.stop()
+            return self.VIBRATION_STOPPED
+
+    def stopVibration(self):
+        if self.vibration_timer.isActive():
+            self.vibration_timer.stop()
+            return self.VIBRATION_STOPPED
+
+    def drawPointsAlongLine(self,points:int):
+        # Check if enough points are selected
+        if len(self.selected_points) < 2:
+            return self.INSUFFICIENT_DATA
+
+        pts = [self.points[i] for i in self.selected_points]
+
+        # Check if points are collinear
+        if not self.checkCollinearPoints(pts):
+            return self.POINTS_NOT_COLLINEAR
+
+        # Add n points along the line
+        self.extendPointsAlongLine(pts, points)
+        self.updatePlot()
+
+    def checkCollinearPoints(self, pts):
+        # At least 2 points needed
+        if len(pts) <= 2:
+            return True
+
+        # Vector from first to second point
+        p0 = pts[0]
+        p1 = pts[1]
+        v = [p1[i] - p0[i] for i in range(3)]
+
+        # Check every other point lies on the line by verifying
+        # that vector from p0 to pt is parallel to v
+        for pt in pts[2:]:
+            w = [pt[i] - p0[i] for i in range(3)]
+
+            # Cross product of v and w should be zero vector if collinear
+            cross = [
+                v[1]*w[2] - v[2]*w[1],
+                v[2]*w[0] - v[0]*w[2],
+                v[0]*w[1] - v[1]*w[0]
+            ]
+
+            # If magnitude of cross product > small epsilon, not collinear
+            if (cross[0]**2 + cross[1]**2 + cross[2]**2) > 1e-10:
+                return False
+
+        return True
+
+    def extendPointsAlongLine(self, pts, n):
+        # Use first two points to define line direction
+        p0 = pts[0]
+        p1 = pts[1]
+        direction = [p1[i] - p0[i] for i in range(3)]
+
+        # Normalize direction vector
+        length = sum(d**2 for d in direction) ** 0.5
+        if length == 0:
+            return  # Avoid division by zero
+        direction = [d / length for d in direction]
+
+        # Find last point in the selected points along the line
+        # We'll add points starting from the max projection point
+        projections = [sum((pt[i] - p0[i]) * direction[i] for i in range(3)) for pt in pts]
+        max_proj = max(projections)
+
+        # Distance between two first points (step size)
+        step = length
+
+        # Add n points beyond max_proj in direction
+        for i in range(1, n + 1):
+            new_point = [p0[j] + (max_proj + i * step) * direction[j] for j in range(3)]
+            self.points.append(new_point)
+
